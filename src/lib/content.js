@@ -39,10 +39,18 @@ function normalizePath(path) {
     }
   }
 
-  // Modified part: instead of purely splitting on `\\` and `/`, we split on
+  // Modified part:
+
+  // Assumption: `\\\\[` or `\\\\(` means that the first `\\` is the path separator, and the second
+  // `\\` is the escape for the special `[]` and `()` characters and therefore we want to rewrite
+  // it as `/` and then the escape `\\` which will result in `/\\`.
+  path = path.replace(/\\\\([\[\]\(\)])/g, '/\\$1')
+
+  // Instead of purely splitting on `\\` and `/`, we split on
   // `/` and `\\` that is _not_ followed by any of the following characters: ()[]
   // This is to ensure that we keep the escaping of brackets and parentheses
   let segs = path.split(/[/\\]+(?![\(\)\[\]])/)
+
   return prefix + segs.join('/')
 }
 
@@ -103,9 +111,10 @@ export function parseCandidateFiles(context, tailwindConfig) {
     skip: [context.userConfigPath],
   })
 
+  console.log({ files })
+
   // Normalize the file globs
   files = files.filter((filePath) => typeof filePath === 'string')
-  files = files.map(normalizePath)
 
   // Split into included and excluded globs
   let tasks = fastGlob.generateTasks(files)
@@ -123,14 +132,22 @@ export function parseCandidateFiles(context, tailwindConfig) {
 
   let paths = [...included, ...excluded]
 
+  console.log('parseCandidateFiles 0', { paths })
+
   // Resolve paths relative to the config file or cwd
   paths = resolveRelativePaths(context, paths)
+
+  console.log('parseCandidateFiles 1', { paths })
 
   // Resolve symlinks if possible
   paths = paths.flatMap(resolvePathSymlinks)
 
+  console.log('parseCandidateFiles 2', { paths })
+
   // Update cached patterns
   paths = paths.map(resolveGlobPattern)
+
+  console.log('parseCandidateFiles 3', { paths })
 
   return paths
 }
@@ -143,8 +160,21 @@ export function parseCandidateFiles(context, tailwindConfig) {
  */
 function parseFilePath(filePath, ignore) {
   // Escape special characters in the file path such as: ()[]
-  // But only if the special character isn't already escaped
-  filePath = filePath.replace(/(?<!\\)([\[\]\(\)])/g, '\\$1')
+  // But only if the special character isn't already escaped (and balanced)
+  filePath = filePath
+    .replace(/(\\)?\[(.*?)\]/g, (match, prefix, contents) => {
+      return match.startsWith('\\[') && match.endsWith('\\]')
+        ? match
+        : `${prefix || ''}\\[${contents}\\]`
+    })
+    .replace(/(\\)?\((.*?)\)/g, (match, prefix, contents) => {
+      return match.startsWith('\\(') && match.endsWith('\\)')
+        ? match
+        : `${prefix || ''}\\(${contents}\\)`
+    })
+
+  // Normalize the file path for Windows
+  filePath = normalizePath(filePath)
 
   let contentPath = {
     original: filePath,
@@ -167,17 +197,10 @@ function parseFilePath(filePath, ignore) {
  * @returns {ContentPath}
  */
 function resolveGlobPattern(contentPath) {
-  // This is required for Windows support to properly pick up Glob paths.
-  // Afaik, this technically shouldn't be needed but there's probably
-  // some internal, direct path matching with a normalized path in
-  // a package which can't handle mixed directory separators
-  let base = normalizePath(contentPath.base)
+  contentPath.pattern = contentPath.glob
+    ? `${contentPath.base}/${contentPath.glob}`
+    : contentPath.base
 
-  // If the user's file path contains any special characters (like parens) for instance fast-glob
-  // is like "OOOH SHINY" and treats them as such. So we have to escape the base path to fix this
-  base = fastGlob.escapePath(base)
-
-  contentPath.pattern = contentPath.glob ? `${base}/${contentPath.glob}` : base
   contentPath.pattern = contentPath.ignore ? `!${contentPath.pattern}` : contentPath.pattern
 
   return contentPath
@@ -196,11 +219,19 @@ function resolveRelativePaths(context, contentPaths) {
 
   // Resolve base paths relative to the config file (when possible) if the experimental flag is enabled
   if (context.userConfigPath && context.tailwindConfig.content.relative) {
-    resolveFrom = [path.dirname(context.userConfigPath)]
+    resolveFrom = [path.posix.dirname(context.userConfigPath)]
   }
 
   return contentPaths.map((contentPath) => {
-    contentPath.base = path.resolve(...resolveFrom, contentPath.base)
+    contentPath.base = path.posix.resolve(...resolveFrom, contentPath.base)
+
+    if (
+      path.sep === '\\' &&
+      contentPath.base.startsWith('/') &&
+      !contentPath.base.startsWith('//?/')
+    ) {
+      contentPath.base = `C:${contentPath.base}`
+    }
 
     return contentPath
   })
@@ -219,7 +250,7 @@ function resolvePathSymlinks(contentPath) {
   let paths = [contentPath]
 
   try {
-    let resolvedPath = fs.realpathSync(contentPath.base)
+    let resolvedPath = normalizePath(fs.realpathSync(contentPath.base))
     if (resolvedPath !== contentPath.base) {
       paths.push({
         ...contentPath,
@@ -267,6 +298,9 @@ function resolveChangedFiles(candidateFiles, fileModifiedMap) {
   let changedFiles = new Set()
   env.DEBUG && console.time('Finding changed files')
   let files = fastGlob.sync(paths, { absolute: true })
+
+  console.log({ paths, files })
+
   for (let file of files) {
     let prevModified = fileModifiedMap.get(file) || -Infinity
     let modified = fs.statSync(file).mtimeMs
